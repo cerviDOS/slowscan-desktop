@@ -11,4 +11,4 @@ itertools = "0.15.0"
 rodio = "0.22.2"
 rustfft = "6.4.1"
 windowfunctions = "0.1.1"
-iced = { version = "0.14.0", features = ["image", "advanced"] }
+iced = { version = "0.14.0", features = ["image", "advanced", "sipper"] }

@@ -6,7 +6,8 @@ use std::iter::zip;
 use std::ops::Div;
 use iced::advanced::graphics::core::window;
 use iced::advanced::graphics::text::cosmic_text::skrifa::raw::types::newtype_scalar;
-use iced::{Application, Program};
+use iced::task::{Sipper, sipper};
+use iced::{Application, Program, Task};
 use iced::widget::{button, column, image, row, text_input};
 use iced::Element;
 use bytes::Bytes;
@@ -40,7 +41,7 @@ const COLOR_HIGH_HZ: u32 = 2300;
 const HSYNC_FREQUENCY_TOLERANCE_HZ: u32 = 50;
 const HSYNC_TIMING_TOLERANCE_MS: f32 = 0.5;
 
-const NUM_SCANLINES: usize = 240;
+const NUM_SCANLINES: usize = 256;
 const PIXELS_PER_SCANLINE: usize = 320;
 
 const MARTIN_M1_SIG: SSTVSignature = SSTVSignature {
@@ -343,23 +344,24 @@ fn demodulate_frequencies(waveform: &[f32; FFT_SIZE], sample_rate: u32) -> Vec<f
     frequencies
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    ChangeColor,
-    FilePathChanged(String),
-    Decode
-}
-
-const WIDTH: usize = 320;
-const HEIGHT: usize = 256;
-
 #[derive(Clone, Copy)]
-struct PixelRGBA {
+pub struct PixelRGBA {
     r: u8,
     g: u8,
     b: u8,
     a: u8
 }
+
+#[derive(Clone)]
+pub enum Message {
+    FilePathChanged(String),
+    StartDecode,
+    DecodeProgress(Box<[PixelRGBA; 320]>),
+    DecodeComplete(Result<(), ()>)
+}
+
+const WIDTH: usize = 320;
+const HEIGHT: usize = 256;
 
 impl From<PixelRGBA> for Vec<u8> {
     fn from(pixel: PixelRGBA) -> Vec<u8> {
@@ -390,7 +392,7 @@ impl SlowScan {
     pub fn new() -> Self {
         Self {
             filepath: String::from(""),
-            pixels: vec![PixelRGBA::default(); WIDTH * NUM_SCANLINES],
+            pixels: vec![PixelRGBA::default(); WIDTH * HEIGHT],
             curr_scanline: 0,
             sstv_decoder: SSTVDecoder::new(44100)
         }
@@ -405,70 +407,58 @@ impl SlowScan {
             WIDTH as u32,
             NUM_SCANLINES as u32,
             self.pixels_to_bytes());
-        //let handle = iced::advanced::image::Handle::from_path("bars.png");
 
         column![
             row![
                 text_input("enter file path of signal", &self.filepath)
                     .on_input(Message::FilePathChanged),
-                button("decode").on_press(Message::Decode)
+                button("decode").on_press(Message::StartDecode)
             ],
             image(handle)
         ].into()
     }
 
-    pub fn update(&mut self, message: Message) {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ChangeColor => {
-
-                let mut rng = rand::rng();
-
-                let r = rng.random::<u8>();
-                let g = rng.random::<u8>();
-                let b = rng.random::<u8>();
-
-                self.fill(r, g, b, 255);
-            }
             Message::FilePathChanged(new_path) => {
                 self.filepath = new_path;
+                Task::none()
             }
-            Message::Decode => {
-                self.decode();
+            Message::StartDecode => {
+                let file = File::open(&self.filepath);
+
+                if file.is_err() {
+                    println!("File at path \"{}\" does not exist", self.filepath);
+                    return Task::none();
+                }
+                let file = file.unwrap();
+
+                Task::sip(
+                    SlowScan::decode(file),
+                    Message::DecodeProgress,
+                    Message::DecodeComplete
+                )
+            }
+            Message::DecodeProgress(scanline) => {
+                self.update_scanline(&scanline);
+                Task::none()
+            }
+            Message::DecodeComplete(_) => {
+                self.curr_scanline = 0;
+                println!("Decoding complete.");
+                Task::none()
             }
         }
     }
 
-    fn fill(&mut self, r: u8, g: u8, b: u8, a: u8) {
-        for pixel in &mut self.pixels {
-            pixel.r = r;
-            pixel.g = g;
-            pixel.b = b;
-            pixel.a = a;
-        }
-    }
-
-    fn decode(&mut self) {
-        let file = File::open(&self.filepath);
-
-        if file.is_err() {
-            println!("File at path \"{}\" does not exist", &self.filepath);
-            return;
-        }
-
-        let file = file.unwrap();
+    fn decode(file: File) -> impl Sipper<Result<(),()>, Box<[PixelRGBA; 320]>> {
+        // TODO: validate filepath before calling fn
 
         let decoder = Decoder::try_from(file).unwrap();
         let sample_rate = decoder.sample_rate();
         let mut waveform = decoder.collect_vec();
 
-        // TODO: create version of chunks that returns chunk_size or padded with zeros
-        // also use buffer instead of keeping entire audio file in memory,
-        // also place computations in a separate thread to stop main thread from freezing
-        //let (waveform_chunks, remainder) = waveform.as_chunks::<FFT_SIZE>();
-
-        // TODO:
-        // - Use buffer instead of keeping entire audio file in memory.
-        // - Place computations in separate thread to prevent main thread from freezing.
+        let mut sstv_decoder = SSTVDecoder::new(sample_rate.into());
 
         // Computing instantaneous frequency with a hilbert transform introduces
         // edge effects and causes the beginning and end of the returned frequencies
@@ -484,34 +474,36 @@ impl SlowScan {
         let trim_size = FFT_SIZE / 4;
         let stride = FFT_SIZE - trim_size * 2;
 
-        for samples in waveform.array_windows::<FFT_SIZE>().step_by(stride) {
-            let frequencies = demodulate_frequencies(samples, sample_rate.into());
+        sipper(async move |mut sender| {
+            for samples in waveform.array_windows::<FFT_SIZE>().step_by(stride) {
+                let frequencies = demodulate_frequencies(samples, sample_rate.into());
 
-            let scanline = self.sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
-            if let Some(scanline) = scanline {
-                self.update_scanline(scanline);
-
-                self.curr_scanline += 1;
-
-                if (self.curr_scanline >= NUM_SCANLINES) {
-                    self.curr_scanline = 0;
-                    return;
+                let scanline = sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
+                if let Some(scanline) = scanline {
+                    sender.send(Box::new(scanline)).await;
                 }
             }
-        }
+
+            Ok(())
+        })
     }
 
-    fn update_scanline(&mut self, new_scanline: [PixelRGBA; 320]) {
+    fn update_scanline(&mut self, new_scanline: &[PixelRGBA; 320]) {
+        println!("Updating scanline {}...", self.curr_scanline);
+        if self.curr_scanline >= HEIGHT {
+            return;
+        }
+
         let scanline_start = PIXELS_PER_SCANLINE * self.curr_scanline;
         let scanline_end = scanline_start + PIXELS_PER_SCANLINE;
 
         let scanline = &mut self.pixels[scanline_start..scanline_end];
 
-        println!("window size={}, scanline={}", scanline.len(), self.curr_scanline);
-
         for (pixel_to_update, new_pixel) in scanline.iter_mut().zip(new_scanline) {
-            *pixel_to_update = new_pixel;
+            *pixel_to_update = *new_pixel;
         }
+
+        self.curr_scanline += 1;
     }
 
     fn pixels_to_bytes(&self) -> Bytes {
