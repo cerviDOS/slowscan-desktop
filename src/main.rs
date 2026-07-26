@@ -1,13 +1,16 @@
-#![allow(unused)]
-
+use std::collections::VecDeque;
 use std::fs::File;
+use std::num::NonZero;
 use iced::task::{Sipper, sipper};
 use iced::{Application, Program, Task};
-use iced::widget::{button, column, image, row, text_input};
+use iced::widget::{button, checkbox, column, image, row, text_input};
 use iced::Element;
-use bytes::Bytes;
+use bytes::{Bytes};
 use itertools::Itertools;
-use rodio::{Decoder, Source};
+use rodio::buffer::SamplesBuffer;
+use rodio::microphone::{MicrophoneBuilder};
+use rodio::source::EmptyCallback;
+use rodio::{Decoder, Player, Source};
 
 mod sstv;
 use sstv::SSTVDecoder;
@@ -22,39 +25,39 @@ use demod::demodulate_frequencies;
 // width and height of the image may change between modes,
 // need a better way to handle than defining constants here.
 
-#[derive(Clone)]
-pub enum Message {
-    FilePathChanged(String),
-    StartDecode,
-    DecodeProgress(Box<[PixelRGBA; 320]>),
-    DecodeComplete(Result<(), ()>)
-}
-
 const FFT_SIZE: usize = 1024;
 
 const WIDTH: usize = 320;
 const HEIGHT: usize = 256;
 
+#[derive(Clone)]
+pub enum Message {
+    FilePathChanged(String),
+    PlayToggled(bool),
+    StartDecode,
+    DecodeProgress(Box<[PixelRGBA; WIDTH]>),
+    DecodeComplete(Result<(), ()>)
+}
+
 struct SlowScan {
+    play_while_decoding: bool,
     filepath: String,
     pixels: Vec<PixelRGBA>,
     curr_scanline: usize,
-    sstv_decoder: SSTVDecoder
 }
 
 impl SlowScan {
-
     pub fn new() -> Self {
         Self {
+            play_while_decoding: false,
             filepath: String::from(""),
             pixels: vec![PixelRGBA::default(); WIDTH * HEIGHT],
             curr_scanline: 0,
-            sstv_decoder: SSTVDecoder::new(44100)
         }
     }
 
     pub fn title(&self) -> String {
-        String::from("meowy interesting")
+        String::from("slowscan")
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -67,9 +70,14 @@ impl SlowScan {
             row![
                 text_input("enter file path of signal", &self.filepath)
                     .on_input(Message::FilePathChanged),
-                button("decode").on_press(Message::StartDecode)
+                column![
+                    button("decode").on_press(Message::StartDecode),
+                    checkbox(self.play_while_decoding)
+                        .label("play audio?").on_toggle(Message::PlayToggled),
+                ]
             ],
-            image(handle)
+            image(handle),
+
         ].into()
     }
 
@@ -79,20 +87,32 @@ impl SlowScan {
                 self.filepath = new_path;
                 Task::none()
             }
+            Message::PlayToggled(should_play_audio) => {
+                self.play_while_decoding = should_play_audio;
+                Task::none()
+            }
             Message::StartDecode => {
-                let file = File::open(&self.filepath);
+                //let file = File::open(&self.filepath);
 
+                let file = File::open("sstv_meow.wav");
                 if file.is_err() {
                     println!("File at path \"{}\" does not exist", self.filepath);
                     return Task::none();
                 }
+
                 let file = file.unwrap();
 
-                Task::sip(
-                    SlowScan::decode(file),
-                    Message::DecodeProgress,
-                    Message::DecodeComplete
-                )
+                if self.play_while_decoding {
+                    Task::sip(
+                        SlowScan::decode_and_play_file(file),
+                        Message::DecodeProgress,
+                        Message::DecodeComplete
+                    )
+                } else {
+                    // TODO: Create function for instantaneous decoding,
+                    // abstract away decoding logic.
+                    Task::none()
+                }
             }
             Message::DecodeProgress(scanline) => {
                 self.update_scanline(&scanline);
@@ -106,11 +126,15 @@ impl SlowScan {
         }
     }
 
-    fn decode(file: File) -> impl Sipper<Result<(),()>, Box<[PixelRGBA; WIDTH]>> {
-        // TODO: validate filepath before calling fn
-
+    fn decode_and_play_file(file: File) -> impl Sipper<Result<(),()>, Box<[PixelRGBA; WIDTH]>> {
         let decoder = Decoder::try_from(file).unwrap();
+        let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
+
+        // TODO:
+        // Stop loading the entire file into memory...
+        // Experiment with chunk sizes to balance out
+        // performance hit from using tiny chunks.
         let waveform = decoder.collect_vec();
 
         let mut sstv_decoder = SSTVDecoder::new(sample_rate.into());
@@ -130,20 +154,66 @@ impl SlowScan {
         let stride = FFT_SIZE - trim_size * 2;
 
         sipper(async move |mut sender| {
+            let handle = rodio::DeviceSinkBuilder::open_default_sink().unwrap();
+            let player = Player::connect_new(handle.mixer());
+
+            player.pause();
+
+            let mut scanline_backlog = VecDeque::new();
+
+            let (tx, rx) = flume::bounded(0);
+
             for samples in waveform.array_windows::<FFT_SIZE>().step_by(stride) {
+                let to_play = SamplesBuffer::new(
+                    channels,
+                    sample_rate,
+                    &samples[trim_size..FFT_SIZE-trim_size]);
+
+                player.append(to_play);
+
                 let frequencies = demodulate_frequencies::<FFT_SIZE>(samples, sample_rate.into());
 
                 let scanline = sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
                 if let Some(scanline) = scanline {
-                    sender.send(Box::new(scanline)).await;
+                    let scanline = Box::new(scanline);
+                    scanline_backlog.push_back(scanline);
+
+                    let tx = tx.clone();
+                    let callback = EmptyCallback::new(Box::new(move || {
+                        let _ = tx.send(());
+                    }));
+
+                    player.append(callback);
                 }
             }
 
+            player.play();
+
+            while rx.recv_async().await.is_ok() {
+                if let Some(scanline) = scanline_backlog.pop_front() {
+                    sender.send(scanline).await;
+                }
+            }
+
+            player.sleep_until_end();
             Ok(())
         })
+
+    }
+
+    //fn decode_from_microphone() -> impl Sipper<Result<(), ()>, Box<[PixelRGBA; WIDTH]>> {
+    fn decode_from_microphone() {
+        let mic = MicrophoneBuilder::new()
+            .default_device().unwrap()
+            .default_config().unwrap()
+            .try_channels(NonZero::new(1).unwrap()).unwrap()
+            .open_stream().unwrap();
+
+        // FIXME
     }
 
     fn update_scanline(&mut self, new_scanline: &[PixelRGBA; WIDTH]) {
+        println!("Updating scanline {}", self.curr_scanline);
         if self.curr_scanline >= HEIGHT {
             return;
         }
@@ -179,3 +249,5 @@ fn init_app() -> Application<impl Program> {
 fn main() -> iced::Result {
     init_app().run()
 }
+
+
