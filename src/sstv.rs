@@ -3,8 +3,19 @@ use crate::PixelRGBA;
 pub mod signatures;
 use signatures::ModeSignature;
 
-enum SSTVMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SSTVMode {
     MartinM1
+}
+
+impl std::fmt::Display for SSTVMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SSTVMode::MartinM1 => {
+                f.write_str("Martin M1")
+            }
+        }
+    }
 }
 
 const HSYNC_HZ: u32 = 1200;
@@ -28,6 +39,11 @@ enum DecoderState {
     AwaitingHSync,
     WithinHSync,
     Decoding(ColorChannel)
+}
+
+pub struct SSTVConfig {
+    mode: SSTVMode,
+    sample_rate: u32
 }
 
 pub struct SSTVDecoder {
