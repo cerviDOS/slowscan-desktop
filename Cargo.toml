@@ -11,5 +11,5 @@ itertools = "0.15.0"
 rodio = "0.22.2"
 rustfft = "6.4.1"
 windowfunctions = "0.1.1"
-iced = { version = "0.14.0", features = ["image", "advanced", "sipper", "tokio"] }
+iced = { version = "0.14.0", features = ["canvas", "image", "advanced", "sipper", "tokio"] }
 flume = { version = "0.12.0", features = ["async"] }
