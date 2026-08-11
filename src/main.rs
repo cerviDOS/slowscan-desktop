@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+#![allow(unused)]
+
 use std::fs::File;
 use std::num::NonZero;
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use iced::{Application, Program, Task, Theme};
 use iced::widget::{button, checkbox, column, container, image, radio, row, rule, space, text, text_input};
 use iced::Element;
 use bytes::{Bytes};
+use iced_plot::PlotWidget;
 use itertools::Itertools;
+use iced_plot::PlotWidgetBuilder;
 use rodio::buffer::SamplesBuffer;
 use rodio::microphone::{MicrophoneBuilder};
 use rodio::source::EmptyCallback;
@@ -35,26 +38,17 @@ use demod::demodulate_frequencies;
 // Experiment with chunk sizes to balance out
 // performance hit from using tiny chunks.
 
-
 const FFT_SIZE: usize = 1024;
 
 const WIDTH: usize = 320;
 const HEIGHT: usize = 256;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecoderSource {
     File,
     Microphone,
     Soundcard
-}
-
-struct DecoderProgressInfo {
-    scanline: Option<Box<[PixelRGBA; WIDTH]>>,
-    // TODO:
-    //  Time elapsed / Time expected
-    //      0m:0s / 1m:55s for file
-    //      0m:0s / - for mic
-    //  Bytes/s
 }
 
 #[derive(Clone)]
@@ -65,7 +59,8 @@ enum Message {
     ModeChanged(sstv::SSTVMode),
     StartDecode,
     DecodeProgress(Box<[PixelRGBA; WIDTH]>),
-    DecodeComplete(Result<(), ()>)
+    DecodeComplete(Result<(), ()>),
+    PlaceHolder
 }
 
 struct SlowScan {
@@ -73,27 +68,54 @@ struct SlowScan {
 
     selected_source: Option<DecoderSource>,
     should_display_file_widgets: bool,
-    
+
     selected_mode: Option<sstv::SSTVMode>,
 
     filepath: String,
     pixels: Vec<PixelRGBA>,
     curr_scanline: usize,
+
+    spectrogram: PlotWidget,
+    spectrum_analyzer: PlotWidget
 }
 
 impl SlowScan {
     pub fn new() -> Self {
+
+        let spectrogram = PlotWidgetBuilder::new()
+            .with_x_label("Time (MS)")
+            .with_y_label("Hz")
+            .disable_controls_help()
+            .disable_legend()
+            .build()
+            .unwrap();
+
+        let mut spectrum_analyzer = PlotWidgetBuilder::new()
+            .with_x_label("Hz")
+            .with_y_label("dB")
+            .disable_controls_help()
+            .disable_legend()
+            .build()
+            .unwrap();
+
+        spectrum_analyzer.get_controls_mut()
+            .unbind_drag(iced::mouse::Button::Left);
+
+
         Self {
             play_while_decoding: false,
 
             selected_source: None,
             should_display_file_widgets: false,
-            
+
             selected_mode: None,
 
             filepath: String::from(""),
             pixels: vec![PixelRGBA::default(); WIDTH * HEIGHT],
             curr_scanline: 0,
+
+            spectrogram,
+            spectrum_analyzer
         }
     }
 
@@ -110,9 +132,11 @@ impl SlowScan {
             WIDTH as u32,
             HEIGHT as u32,
             self.pixels_to_bytes());
-        
+
         column![
-            row![ // Top panel
+            row![ // Top Row
+
+                // Config Panel
                 container(column![
                     text("Config").width(Fill).center(),
 
@@ -128,8 +152,6 @@ impl SlowScan {
 
                                 checkbox(self.play_while_decoding)
                                     .label("sync decoding with audio?")
-                                    .text_size(12)
-                                    .size(12)
                                     .width(Fill)
                                     .on_toggle(Message::PlayToggled),
                             ].padding(5)
@@ -143,17 +165,29 @@ impl SlowScan {
                             self.selected_mode,
                             Message::ModeChanged
                         ).text_size(12)
-                    ].align_y(Center)
+                    ]
 
-                ]).width(FillPortion(2)).height(FillPortion(3)),
+                ]).width(FillPortion(2)),
 
                 rule::vertical(1),
-
+                // Status Panel
                 container(column![
                     text("Status").width(Fill).center(),
 
-                    text("Scanline Progress:").size(12),
-                    text(format!("{}/{}", self.curr_scanline, HEIGHT)).size(12),
+                    text("Progress:"),
+                    text(format!("{}/{} scanlines", self.curr_scanline, HEIGHT)).width(Fill).center(),
+
+                    /*
+                    text("Decoder State:"),
+                    text("AWAITING_SCANLINE").width(Fill).center(),
+
+                    // Don't display if quick decoding from file
+                    text("Time Elapsed:"),
+                    text("0m:0s").width(Fill).center(),
+
+                    text("Processing Rate:"),
+                    text("4 KB/s").width(Fill).center(),
+                    */
 
                     space().height(Fill),
 
@@ -161,23 +195,23 @@ impl SlowScan {
                         button("decode").on_press(Message::StartDecode),
                         space().height(5)
                     ]
-                    ).width(Fill).align_x(Center)
-                    ,
-                ]).width(FillPortion(1)).height(Fill),
+                    ).width(FillPortion(1)).align_x(Center)
+                ]),
 
                 rule::vertical(1),
 
-                image(handle),
-            ],
+                image(handle).expand(true)
+            ].height(FillPortion(3)),
 
             rule::horizontal(1),
 
-            row![ // Bottom panel
+            row![ // Bottom Row
                 // Spectrogram & spectrum
-                text("Spectrogram").width(FillPortion(2)).align_y(Center).align_x(Center),
+                //text("Spectrogram").width(FillPortion(2)).center(),
+                container(self.spectrogram.view().map(|msg| { Message::PlaceHolder })).width(FillPortion(2)),
                 rule::vertical(1),
-                text("Spectrum Analyzer").width(Fill).align_y(Center).align_x(Center),
-            ].height(Fill)
+                container(self.spectrum_analyzer.view().map(|msg| { Message::PlaceHolder })).width(FillPortion(1)),
+            ]
         ].into()
     }
 
@@ -201,6 +235,8 @@ impl SlowScan {
                 Task::none()
             }
             Message::StartDecode => {
+                self.curr_scanline = 0;
+
                 let file = File::open(&self.filepath);
                 if file.is_err() {
                     println!("File at path \"{}\" does not exist", self.filepath);
@@ -228,10 +264,10 @@ impl SlowScan {
                 Task::none()
             }
             Message::DecodeComplete(_) => {
-                self.curr_scanline = 0;
                 println!("Decoding complete.");
                 Task::none()
             }
+            _ => Task::none()
         }
     }
 
@@ -260,7 +296,8 @@ impl SlowScan {
 
             let scanline = sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
 
-            processing_callback(&sample_window[trim_size..FFT_SIZE-trim_size],
+            processing_callback(
+                &sample_window[trim_size..FFT_SIZE-trim_size],
                 scanline
             );
         }
@@ -270,7 +307,7 @@ impl SlowScan {
         let decoder = Decoder::try_from(file).unwrap();
         let sample_rate = decoder.sample_rate();
 
-               let waveform = decoder.collect_vec();
+        let waveform = decoder.collect_vec();
 
         sipper(async move |mut sender| {
             let (tx, rx) = flume::bounded(0);
@@ -344,7 +381,7 @@ impl SlowScan {
             Ok(())
         })
     }
- 
+
     //fn decode_from_microphone() -> impl Sipper<Result<(), ()>, Box<[PixelRGBA; WIDTH]>> {
     fn decode_from_microphone() {
         let mic = MicrophoneBuilder::new()
@@ -388,7 +425,7 @@ fn init_app() -> Application<impl Program> {
     iced::application(SlowScan::new, SlowScan::update, SlowScan::view)
         .title(SlowScan::title)
         .theme(SlowScan::theme)
-        .window_size((640, 480))
+        .window_size((1280, 720))
 }
 
 fn main() -> iced::Result {

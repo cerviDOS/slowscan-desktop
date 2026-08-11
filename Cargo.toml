@@ -12,4 +12,5 @@ rodio = "0.22.2"
 rustfft = "6.4.1"
 windowfunctions = "0.1.1"
 iced = { version = "0.14.0", features = ["canvas", "image", "advanced", "sipper", "tokio"] }
+iced_plot = "0.5.0"
 flume = { version = "0.12.0", features = ["async"] }
