@@ -1,4 +1,4 @@
-#![allow(unused)]
+//#![allow(unused)]
 
 use std::fs::File;
 use std::num::NonZero;
@@ -23,13 +23,11 @@ use rodio::source::EmptyCallback;
 use rodio::{Decoder, Player, Source};
 
 mod sstv;
-use sstv::SSTVDecoder;
 
 mod pixel;
 use pixel::PixelRGBA;
 
 mod demod;
-use demod::demodulate_frequencies;
 
 // TODO:
 // - Width and height of the image may change between modes, 
@@ -58,7 +56,7 @@ enum Message {
     DecoderSourceChanged(DecoderSource),
     ModeChanged(sstv::SSTVMode),
     StartDecode,
-    DecodeProgress(Box<[PixelRGBA; WIDTH]>),
+    DecodeProgress(Vec<PixelRGBA>),
     DecodeComplete(Result<(), ()>),
     PlaceHolder
 }
@@ -170,6 +168,7 @@ impl SlowScan {
                 ]).width(FillPortion(2)),
 
                 rule::vertical(1),
+
                 // Status Panel
                 container(column![
                     text("Status").width(Fill).center(),
@@ -207,7 +206,6 @@ impl SlowScan {
 
             row![ // Bottom Row
                 // Spectrogram & spectrum
-                //text("Spectrogram").width(FillPortion(2)).center(),
                 container(self.spectrogram.view().map(|msg| { Message::PlaceHolder })).width(FillPortion(2)),
                 rule::vertical(1),
                 container(self.spectrum_analyzer.view().map(|msg| { Message::PlaceHolder })).width(FillPortion(1)),
@@ -260,7 +258,7 @@ impl SlowScan {
                 }
             }
             Message::DecodeProgress(scanline) => {
-                self.update_scanline(&scanline);
+                self.update_scanline(scanline);
                 Task::none()
             }
             Message::DecodeComplete(_) => {
@@ -271,39 +269,7 @@ impl SlowScan {
         }
     }
 
-    fn decode<I, F>(samples: I, sample_rate: u32, mut processing_callback: F) where
-        I: IntoIterator<Item = f32>,
-        F: FnMut(&[f32], Option<[PixelRGBA; WIDTH]>)
-    {
-        // Computing instantaneous frequency with a hilbert transform introduces
-        // edge effects and causes the beginning and end of the returned frequencies
-        // to be highly instable.
-        //
-        // Trimming off the edges will isolate the more accurate frequencies in the
-        // center whereas iterating with an overlap of FFT_SIZE - trim_size * 2 will
-        // close the gaps caused by removing samples from the end.
-        //
-        // Trimming a larger chunk off the edges will improve overall accuracy at the cost
-        // of repeated computations, though cutting the outermost 4th seems to be the
-        // sweet spot.
-        let trim_size = FFT_SIZE / 4;
-        let stride = FFT_SIZE - trim_size * 2;
-
-        let mut sstv_decoder = SSTVDecoder::new(sample_rate);
-
-        for sample_window in samples.into_iter().array_windows::<FFT_SIZE>().step_by(stride) {
-            let frequencies = demodulate_frequencies::<FFT_SIZE>(&sample_window, sample_rate);
-
-            let scanline = sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
-
-            processing_callback(
-                &sample_window[trim_size..FFT_SIZE-trim_size],
-                scanline
-            );
-        }
-    }
-
-    fn decode_file(file: File) -> impl Sipper<Result<(),()>, Box<[PixelRGBA; WIDTH]>> {
+    fn decode_file(file: File) -> impl Sipper<Result<(),()>, Vec<PixelRGBA>> {
         let decoder = Decoder::try_from(file).unwrap();
         let sample_rate = decoder.sample_rate();
 
@@ -313,12 +279,12 @@ impl SlowScan {
             let (tx, rx) = flume::bounded(0);
 
             thread::spawn(move || {
-                SlowScan::decode(
+                sstv::decode::<FFT_SIZE, _, _>(
                     waveform,
                     sample_rate.into(),
                     |_, scanline| {
                         if let Some(scanline) = scanline {
-                            let _ = tx.clone().send(Box::new(scanline));
+                            let _ = tx.clone().send(scanline);
                         }
                     }
                 );
@@ -332,7 +298,7 @@ impl SlowScan {
         })
     }
 
-    fn decode_and_play_file(file: File) -> impl Sipper<Result<(),()>, Box<[PixelRGBA; WIDTH]>> {
+    fn decode_and_play_file(file: File) -> impl Sipper<Result<(),()>, Vec<PixelRGBA>> {
         let decoder = Decoder::try_from(file).unwrap();
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
@@ -346,7 +312,7 @@ impl SlowScan {
 
             let player_clone = player.clone();
             thread::spawn(move || {
-                SlowScan::decode(
+                sstv::decode::<FFT_SIZE, _, _>(
                     waveform,
                     sample_rate.into(),
                     |samples, scanline| {
@@ -360,10 +326,13 @@ impl SlowScan {
                         player.append(to_play);
 
                         if let Some(scanline) = scanline {
+
+                            let scanline = Arc::new(scanline);
+
                             let tx = tx.clone();
 
                             let callback = EmptyCallback::new(Box::new(move || {
-                                let _ = tx.send(Box::new(scanline));
+                                let _ = tx.send(scanline.clone());
                             }));
 
                             player.append(callback);
@@ -373,6 +342,8 @@ impl SlowScan {
             });
 
             while let Ok(scanline) = rx.recv_async().await {
+                // Might crash if Rodio holds onto the callbacks
+                let scanline = Arc::into_inner(scanline).unwrap();
                 sender.send(scanline).await;
             }
 
@@ -393,7 +364,7 @@ impl SlowScan {
         // FIXME
     }
 
-    fn update_scanline(&mut self, new_scanline: &[PixelRGBA; WIDTH]) {
+    fn update_scanline(&mut self, new_scanline: Vec<PixelRGBA>) {
         println!("Updating scanline {}", self.curr_scanline);
         if self.curr_scanline >= HEIGHT {
             return;
@@ -405,7 +376,7 @@ impl SlowScan {
         let scanline = &mut self.pixels[scanline_start..scanline_end];
 
         for (pixel_to_update, new_pixel) in scanline.iter_mut().zip(new_scanline) {
-            *pixel_to_update = *new_pixel;
+            *pixel_to_update = new_pixel;
         }
 
         self.curr_scanline += 1;

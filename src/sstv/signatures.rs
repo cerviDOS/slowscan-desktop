@@ -19,8 +19,8 @@ pub struct ModeSignature {
 }
 
 pub const MARTIN_M1: ModeSignature = ModeSignature {
-    num_scanlines: 320,
-    pixels_per_scanline: 256,
+    num_scanlines: 256,
+    pixels_per_scanline: 320,
     hsync_pulse_ms: 4.862,
     hsync_porch_ms: 0.572,
     color_scan_ms: 146.432,
@@ -31,8 +31,8 @@ pub const MARTIN_M1: ModeSignature = ModeSignature {
 };
 
 pub const MARTIN_M2: ModeSignature = ModeSignature {
-    num_scanlines: 320,
-    pixels_per_scanline: 256,
+    num_scanlines: 256,
+    pixels_per_scanline: 320,
     hsync_pulse_ms: 4.862,
     hsync_porch_ms: 0.572,
     color_scan_ms: 73.216,
