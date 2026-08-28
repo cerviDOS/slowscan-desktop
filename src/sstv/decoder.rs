@@ -1,10 +1,6 @@
-use iced::futures::SinkExt;
-
 use crate::PixelRGBA;
 use crate::sstv::SSTVMode;
 use crate::sstv::signatures;
-
-
 
 const HSYNC_HZ: u32 = 1200;
 const COLOR_LOW_HZ: u32 = 1500;
@@ -23,7 +19,7 @@ enum ColorChannel {
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
-enum DecoderState {
+pub enum DecoderState {
     AwaitingHSync,
     WithinHSync,
     Decoding(ColorChannel)
@@ -62,9 +58,8 @@ impl SSTVDecoder {
         self.curr_pixel = 0;
     }
 
-    pub fn set_sample_rate(&mut self, new_sample_rate: u32) {
-        self.sample_rate = new_sample_rate;
-        self.reset();
+    pub fn get_state(&self) -> DecoderState {
+        self.state
     }
 
     fn await_hsync<'a>(&mut self, frequencies: &'a [f32]) -> &'a [f32] {
@@ -227,3 +222,28 @@ impl SSTVDecoder {
     }
 }
 
+impl std::fmt::Display for DecoderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecoderState::AwaitingHSync => {
+                f.write_str("Awaiting H-Sync")
+            }
+            DecoderState::WithinHSync => {
+                f.write_str("Within H-Sync")
+            }
+            DecoderState::Decoding(color) => {
+                match color {
+                    ColorChannel::Red => {
+                        f.write_str("Decoding Color Scan (R)")
+                    }
+                    ColorChannel::Green => {
+                         f.write_str("Decoding Color Scan (G)")
+                    }
+                    ColorChannel::Blue => {
+                        f.write_str("Decoding Color Scan (B)")
+                    }
+                }
+            }
+        }
+    }
+}

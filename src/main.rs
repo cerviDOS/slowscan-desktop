@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use iced::Center;
+use iced::Color;
 use iced::Fill;
 use iced::Length::FillPortion;
 use iced::task::{Sipper, sipper};
@@ -14,7 +15,10 @@ use iced::{Application, Program, Task, Theme};
 use iced::widget::{button, checkbox, column, container, image, radio, row, rule, space, text, text_input};
 use iced::Element;
 use bytes::{Bytes};
+use iced_plot::LineStyle;
 use iced_plot::PlotWidget;
+use iced_plot::Series;
+use iced_plot::ShapeId;
 use itertools::Itertools;
 use iced_plot::PlotWidgetBuilder;
 use rodio::buffer::SamplesBuffer;
@@ -27,6 +31,8 @@ mod sstv;
 mod pixel;
 use pixel::PixelRGBA;
 
+use crate::sstv::SSTVProgress;
+use crate::sstv::decoder::DecoderState;
 mod demod;
 
 // TODO:
@@ -56,7 +62,7 @@ enum Message {
     DecoderSourceChanged(DecoderSource),
     ModeChanged(sstv::SSTVMode),
     StartDecode,
-    DecodeProgress(Vec<PixelRGBA>),
+    DecodeProgress(sstv::SSTVProgress),
     DecodeComplete(Result<(), ()>),
     PlaceHolder
 }
@@ -72,17 +78,33 @@ struct SlowScan {
     filepath: String,
     pixels: Vec<PixelRGBA>,
     curr_scanline: usize,
+    curr_decoder_state: DecoderState,
 
+    total_samples_processed: usize,
+
+    spectrogram_sid: ShapeId,
     spectrogram: PlotWidget,
+
     spectrum_analyzer: PlotWidget
 }
 
 impl SlowScan {
     pub fn new() -> Self {
 
-        let spectrogram = PlotWidgetBuilder::new()
+        let spectrogram_data = [[0.0, 0.0]].repeat(50_000);
+
+        let spectrogram_series = Series::line_only(
+            spectrogram_data,
+            LineStyle::solid().with_pixel_width(1.5)
+        ).with_color(Color::from_rgb8(255, 120, 0));
+        let spectrogram_series_id = spectrogram_series.id;
+
+        let mut spectrogram = PlotWidgetBuilder::new()
             .with_x_label("Time (MS)")
             .with_y_label("Hz")
+            .with_y_lim(1100.0, 2500.0)
+            .add_series(spectrogram_series)
+            .with_autoscale_on_updates(true)
             .disable_controls_help()
             .disable_legend()
             .build()
@@ -99,6 +121,8 @@ impl SlowScan {
         spectrum_analyzer.get_controls_mut()
             .unbind_drag(iced::mouse::Button::Left);
 
+        spectrogram.get_controls_mut()
+            .unbind_drag(iced::mouse::Button::Left);
 
         Self {
             play_while_decoding: false,
@@ -111,7 +135,11 @@ impl SlowScan {
             filepath: String::from(""),
             pixels: vec![PixelRGBA::default(); WIDTH * HEIGHT],
             curr_scanline: 0,
+            curr_decoder_state: DecoderState::AwaitingHSync,
 
+            total_samples_processed: 0,
+
+            spectrogram_sid: spectrogram_series_id,
             spectrogram,
             spectrum_analyzer
         }
@@ -122,7 +150,7 @@ impl SlowScan {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::CatppuccinMacchiato
+        Theme::CatppuccinMocha
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -176,10 +204,10 @@ impl SlowScan {
                     text("Progress:"),
                     text(format!("{}/{} scanlines", self.curr_scanline, HEIGHT)).width(Fill).center(),
 
-                    /*
                     text("Decoder State:"),
-                    text("AWAITING_SCANLINE").width(Fill).center(),
+                    text(self.curr_decoder_state.to_string()).width(Fill).center(),
 
+                    /*
                     // Don't display if quick decoding from file
                     text("Time Elapsed:"),
                     text("0m:0s").width(Fill).center(),
@@ -235,7 +263,8 @@ impl SlowScan {
             Message::StartDecode => {
                 self.curr_scanline = 0;
 
-                let file = File::open(&self.filepath);
+                //let file = File::open(&self.filepath);
+                let file = File::open("/home/wizard/Downloads/sstv_signal.wav");
                 if file.is_err() {
                     println!("File at path \"{}\" does not exist", self.filepath);
                     return Task::none();
@@ -257,8 +286,33 @@ impl SlowScan {
                     )
                 }
             }
-            Message::DecodeProgress(scanline) => {
-                self.update_scanline(scanline);
+            Message::DecodeProgress(progress) => {
+                self.curr_decoder_state = progress.decoder_state;
+
+                if let Some(scanline) = progress.scanline {
+                    self.update_scanline(scanline);
+                }
+
+                self.spectrogram.update_series(&self.spectrogram_sid, |series| {
+                    let frequencies = progress.frequencies.iter().map(|freq| {
+                        self.total_samples_processed += 1;
+                        [self.total_samples_processed as f64, *freq as f64]
+                    }).collect_vec();
+
+                    // NOTE: Currently drawing every single point.
+                    // Maybe the entire signal could be displayed at once using downsampling/mipmapping.
+                    let total_len = series.positions.len() + frequencies.len();
+                    if total_len > series.positions.capacity() {
+                        // Shift down to discard the oldest data points then fill the void with the new frequencies.
+                        // Seems to be more efficient than removing one by one.
+                        series.positions.copy_within(frequencies.len()-1.., 0);
+
+                        let pos_to_insert = series.positions.capacity() - frequencies.len();
+                        series.positions[pos_to_insert..].copy_from_slice(&frequencies);
+                    }
+                }).unwrap();
+
+
                 Task::none()
             }
             Message::DecodeComplete(_) => {
@@ -269,7 +323,7 @@ impl SlowScan {
         }
     }
 
-    fn decode_file(file: File) -> impl Sipper<Result<(),()>, Vec<PixelRGBA>> {
+    fn decode_file(file: File) -> impl Sipper<Result<(),()>, SSTVProgress> {
         let decoder = Decoder::try_from(file).unwrap();
         let sample_rate = decoder.sample_rate();
 
@@ -282,10 +336,8 @@ impl SlowScan {
                 sstv::decode::<FFT_SIZE, _, _>(
                     waveform,
                     sample_rate.into(),
-                    |_, scanline| {
-                        if let Some(scanline) = scanline {
-                            let _ = tx.clone().send(scanline);
-                        }
+                    |progress| {
+                        let _ = tx.clone().send(progress);
                     }
                 );
             });
@@ -298,7 +350,7 @@ impl SlowScan {
         })
     }
 
-    fn decode_and_play_file(file: File) -> impl Sipper<Result<(),()>, Vec<PixelRGBA>> {
+    fn decode_and_play_file(file: File) -> impl Sipper<Result<(),()>, SSTVProgress> {
         let decoder = Decoder::try_from(file).unwrap();
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
@@ -315,36 +367,32 @@ impl SlowScan {
                 sstv::decode::<FFT_SIZE, _, _>(
                     waveform,
                     sample_rate.into(),
-                    |samples, scanline| {
+                    |progress| {
+                        //let progress = Arc::new(progress);
+
 
                         let player = player_clone.lock().unwrap();
                         let to_play = SamplesBuffer::new(
                             channels,
                             sample_rate,
-                            samples);
+                            progress.samples.clone());
 
                         player.append(to_play);
 
-                        if let Some(scanline) = scanline {
+                        let tx = tx.clone();
 
-                            let scanline = Arc::new(scanline);
+                        let callback = EmptyCallback::new(Box::new(move || {
+                            let _ = tx.send(progress.clone());
+                        }));
 
-                            let tx = tx.clone();
+                        player.append(callback);
 
-                            let callback = EmptyCallback::new(Box::new(move || {
-                                let _ = tx.send(scanline.clone());
-                            }));
-
-                            player.append(callback);
-                        }
                     }
                 );
             });
 
-            while let Ok(scanline) = rx.recv_async().await {
-                // Might crash if Rodio holds onto the callbacks
-                let scanline = Arc::into_inner(scanline).unwrap();
-                sender.send(scanline).await;
+            while let Ok(progress) = rx.recv_async().await {
+                sender.send(progress).await;
             }
 
             player.lock().unwrap().sleep_until_end();
@@ -374,10 +422,7 @@ impl SlowScan {
         let scanline_end = scanline_start + WIDTH;
 
         let scanline = &mut self.pixels[scanline_start..scanline_end];
-
-        for (pixel_to_update, new_pixel) in scanline.iter_mut().zip(new_scanline) {
-            *pixel_to_update = new_pixel;
-        }
+        scanline.copy_from_slice(&new_scanline);
 
         self.curr_scanline += 1;
     }
@@ -391,6 +436,29 @@ impl SlowScan {
         Bytes::from(pixels_split)
     }
 }
+
+struct SettingsPanel {
+    
+}
+
+impl SettingsPanel {
+
+}
+
+struct InformationPanel {}
+
+impl InformationPanel {
+
+}
+
+struct ImagePanel {}
+
+impl ImagePanel {
+
+}
+
+struct PlotPanel {}
+
 
 fn init_app() -> Application<impl Program> {
     iced::application(SlowScan::new, SlowScan::update, SlowScan::view)

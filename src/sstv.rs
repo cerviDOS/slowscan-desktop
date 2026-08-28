@@ -3,8 +3,8 @@ use itertools::Itertools;
 use crate::PixelRGBA;
 use crate::demod::demodulate_frequencies;
 
-mod decoder;
-use decoder::SSTVDecoder;
+pub mod decoder;
+use decoder::{SSTVDecoder, DecoderState};
 
 mod signatures;
 
@@ -23,8 +23,12 @@ impl std::fmt::Display for SSTVMode {
     }
 }
 
+#[derive(Clone)]
 pub struct SSTVProgress {
-
+    pub samples: Vec<f32>,
+    pub frequencies: Vec<f32>,
+    pub scanline: Option<Vec<PixelRGBA>>,
+    pub decoder_state: DecoderState
     // samples,
     // sample rate
     // frequencies (fft result),
@@ -34,7 +38,7 @@ pub struct SSTVProgress {
 
 pub fn decode<const FFT_SIZE: usize, I, F>(samples: I, sample_rate: u32, mut processing_callback: F) where
     I: IntoIterator<Item = f32>,
-    F: FnMut(&[f32], Option<Vec<PixelRGBA>>)
+    F: FnMut(SSTVProgress)
 {
     // Computing instantaneous frequency with a hilbert transform introduces
     // edge effects and causes the beginning and end of the returned frequencies
@@ -56,9 +60,15 @@ pub fn decode<const FFT_SIZE: usize, I, F>(samples: I, sample_rate: u32, mut pro
         let frequencies = demodulate_frequencies::<FFT_SIZE>(&sample_window, sample_rate);
 
         let scanline = sstv_decoder.process(&frequencies[trim_size..FFT_SIZE-trim_size]);
-        processing_callback(
-            &sample_window[trim_size..FFT_SIZE-trim_size],
-            scanline
-        );
+
+        let progress = SSTVProgress {
+            samples: sample_window[trim_size..FFT_SIZE-trim_size].to_vec(),
+            frequencies: frequencies[trim_size..FFT_SIZE-trim_size].to_vec(),
+            scanline,
+            decoder_state: sstv_decoder.get_state()
+
+        };
+
+        processing_callback(progress);
     }
 }
