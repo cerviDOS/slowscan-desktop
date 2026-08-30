@@ -437,11 +437,79 @@ impl SlowScan {
     }
 }
 
-struct SettingsPanel {
-    
-}
+mod settings {
+    use crate::sstv;
 
-impl SettingsPanel {
+    use iced::FillPortion;
+    use iced::Fill;
+    use iced::Element;
+    use iced::widget::{row, column, radio, checkbox, text, container, pick_list, text_input};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DecoderSource {
+        File,
+        Microphone,
+        Soundcard
+    }
+
+
+    #[derive(Clone)]
+    pub enum Message {
+        PlayToggled(bool),
+        DecoderSourceChanged(DecoderSource),
+        ModeChanged(sstv::SSTVMode),
+        FilePathChanged(String)
+    }
+
+    pub struct SettingsPanel {
+        play_while_decoding: bool,
+
+        selected_source: Option<DecoderSource>,
+        should_display_file_widgets: bool,
+
+        selected_mode: Option<sstv::SSTVMode>,
+
+        filepath: String,
+
+    }
+
+    impl SettingsPanel {
+        pub fn view(&self) -> Element<'_, Message> {
+            // Config Panel
+            container(column![
+                text("Config").width(Fill).center(),
+
+                text("Signal Source:"),
+                column![
+                    radio("File", DecoderSource::File, self.selected_source, Message::DecoderSourceChanged),
+                    (self.should_display_file_widgets).then_some(
+                        column![
+                            text_input("Path to signal...", &self.filepath)
+                                .on_input(Message::FilePathChanged)
+                                .size(12)
+                                .width(FillPortion(5)),
+
+                            checkbox(self.play_while_decoding)
+                                .label("sync decoding with audio?")
+                                .width(Fill)
+                                .on_toggle(Message::PlayToggled),
+                        ].padding(5)
+                    ),
+                ],
+
+                row![
+                    text("Mode:"),
+                    pick_list(
+                        [sstv::SSTVMode::MartinM1],
+                        self.selected_mode,
+                        Message::ModeChanged
+                    ).text_size(12)
+                ]
+
+            ]).width(FillPortion(2)).into()
+        }
+
+    }
 
 }
 
